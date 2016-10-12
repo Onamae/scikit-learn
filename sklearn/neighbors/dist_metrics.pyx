@@ -8,6 +8,7 @@
 # License: BSD
 
 import numpy as np
+import math #changed - imported math
 cimport numpy as np
 np.import_array()  # required in order to use C-API
 
@@ -86,7 +87,8 @@ METRIC_MAPPING = {'euclidean': EuclideanDistance,
                   'sokalmichener': SokalMichenerDistance,
                   'sokalsneath': SokalSneathDistance,
                   'haversine': HaversineDistance,
-                  'pyfunc': PyFuncDistance}
+                  'pyfunc': PyFuncDistance,
+                  'refmdist': RefmDistance}
 
 
 def get_valid_metric_ids(L):
@@ -475,6 +477,119 @@ cdef class SEuclideanDistance(DistanceMetric):
     def dist_to_rdist(self, dist):
         return dist ** 2
 
+#------------------------------------------------------------
+# Refm Distance
+#  custom scoring function for mcdash and dataquick datasets
+cdef class RefmDistance(DistanceMetric):
+    """Refm Scoring Distance metric
+
+    .. math::
+       custom - see PostgreSQL scoring function
+    """
+    def __init__(self):
+        self.p = 1
+
+    cdef inline DTYPE_t dist(self, DTYPE_t* x1, DTYPE_t* x2,
+                             ITYPE_t size) nogil except -1:
+        cdef DTYPE_t score = 0
+        cdef DTYPE_t loan_amount_diff = 0
+        with gil:
+            loan_amount_diff = abs(x2[0] - x1[0]) * 100 / max(x2[0], x1[0])
+            if x2[0] - 500 <= x1[0] and x1[0] <= x2[0] + 500:
+                loan_amount_diff = 0 
+            if loan_amount_diff != 0:
+                loan_amount_diff = min(1, 0.75 + math.sqrt(loan_amount_diff))
+        
+        # missing reo_liq_date -> assuming exists
+        cdef DTYPE_t liquidation_diff = 0
+        cdef DTYPE_t lien_pos_diff = 0
+        cdef DTYPE_t reo_diff = 0
+        with gil:
+            liquidation_diff = min(abs(x2[3] - x1[24]),
+                                abs(x2[3] - x1[4]),
+                                abs(x2[3] - x1[5]))
+        
+            lien_pos_diff = abs(x2[11] - x1[20]) * 0.5
+        
+            reo_diff = min(abs(x2[4] - x1[4]),
+                            abs(x2[5] - x1[4]))
+        
+        cdef DTYPE_t loan_purpose = 1
+        #remb to check implementation for loanpurpose = null
+        #need to pass in pur_flag and loanpurpose to implement lines 36 to 39 -> assuming exists
+        if (x2[13] == True and x1[22] == True) or (x2[14] == True and x1[23] == True):
+            loan_purpose = 0
+        elif (x2[12] == False):
+            loan_purpose = 0.5
+        else:
+            loan_purpose = 1
+
+        cdef DTYPE_t distress_match = 1
+        if (x2[7] == True or x2[6] == True) and x1[9] == True:
+            distress_match = 0
+        if (x2[7] == False and x2[6] == False) and (x1[9] == False or (x1[7] == False 
+            and x1[8] == False and x1[10] == False and x1[11] == False and x1[12] == False 
+            and x1[13] == False and x1[14] == False and x1[9] == False)):
+            distress_match = 0
+
+        cdef DTYPE_t interest_rate_type = 0
+        if (x2[9] == True and x1[16] == True):
+            interest_rate_type = 0
+        elif (x2[10] == True and x1[18] == True):
+            interest_rate_type = 0
+        else:
+            interest_rate_type = 1
+        interest_rate_type = 0 #Undos changes made in the above if statements
+
+        cdef DTYPE_t appraised_diff = 0
+        #cant implement line 52 because loan purpose was not passed in -> assuming exists
+        with gil:
+            if x2[14] == True:
+                appraised_diff = 0.1
+            elif x2[1] is None:
+                appraised_diff = 0.50
+            elif x2[1] == 0 or x1[1] == 0:
+                appraised_diff = 0.1
+            else:
+                appraised_diff = min(abs(x2[1] - x1[1]) / max(x2[1], x1[1]), 1)
+
+        cdef DTYPE_t loan_orig_diff = 0
+        with gil:
+            loan_orig_diff = abs(x2[2] - x1[2])
+            if loan_orig_diff < 31:
+                loan_orig_diff = 0
+            loan_orig_diff = min(loan_orig_diff, 150 + loan_orig_diff / 2)
+        #Note: algorithm does not use fcl_date
+        cdef DTYPE_t hist_end_diff = 0
+        with gil:
+            hist_end_diff = min(abs(x2[3] - x1[24]), #cannot implement b/c reo_liq_date not passed in -> assuming exists
+                                abs(x2[3] - x1[4]),
+                                abs(x2[3] - x1[5]),
+                                abs(x2[3] - x1[3]),
+                                abs(x2[4] - x1[4]),
+                                abs(x2[5] - x1[4]),
+                                abs(x2[4] - x1[5]),
+                                abs(x2[5] - x1[5]))
+            hist_end_diff = min(hist_end_diff, 150 + hist_end_diff / 10)
+
+        #need to pass in paymentstatus_cap to implement lines 109 to 111 -> assuming exists
+        cdef DTYPE_t paymentstatus_cap_penalty = 0
+        if x2[20] == True:
+            paymentstatus_cap_penalty = 0.5
+
+        #cannot implement lines 114 to 129 because all fields passed in are integer fields, no nulls
+
+        score = ((loan_amount_diff ** 2)        * 30
+                + (lien_pos_diff ** 2)          * 10
+                + ((loan_orig_diff / 150) ** 2) * 20
+                + ((hist_end_diff / 150) ** 2)  * 10
+                + (appraised_diff ** 2)         * 10
+                + loan_purpose                  * 5
+                + distress_match                * 5
+                + interest_rate_type            * 5
+                + paymentstatus_cap_penalty     * 5             
+        ) * 100
+        return score
 
 #------------------------------------------------------------
 # Manhattan Distance
